@@ -4,30 +4,41 @@ import { useCallback, useEffect, useRef, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import DualPane from '@/components/DualPane';
 import SessionFooter from '@/components/SessionFooter';
-import { translate as translateApi, getTranscriptWebSocketUrl } from '@/lib/api';
+import { translate as translateApi, getTranscriptWebSocketUrl, speakTranslation } from '@/lib/api';
 
-const LANGUAGE_NAMES = { en: 'English', ar: 'Arabic', ur: 'Urdu', es: 'Spanish', fr: 'French', hi: 'Hindi' };
+const LANGUAGE_NAMES = { en: 'English', ar: 'Arabic', ur: 'Urdu', es: 'Spanish', fr: 'French', hi: 'Hindi', ja: 'Japanese' };
 
 function SessionContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const from = searchParams.get('from') || 'en';
   const to = searchParams.get('to') || 'ar';
+  const twoWay = searchParams.get('twoWay') === 'true';
 
+  const [speakingLang, setSpeakingLang] = useState(from);
   const [sourceText, setSourceText] = useState('');
   const [interim, setInterim] = useState('');
   const [translationText, setTranslationText] = useState('');
+  const [interimTranslation, setInterimTranslation] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [sessionStartTime, setSessionStartTime] = useState(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [error, setError] = useState(null);
   const [micRequesting, setMicRequesting] = useState(false);
+  const [speakTranslationEnabled, setSpeakTranslationEnabled] = useState(false);
 
   const wsRef = useRef(null);
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
   const processorRef = useRef(null);
   const timerIdRef = useRef(null);
+  const ttsQueueRef = useRef([]);
+  const ttsPlayingRef = useRef(false);
+  const ttsAudioRef = useRef(null);
+  const speakEnabledRef = useRef(speakTranslationEnabled);
+  speakEnabledRef.current = speakTranslationEnabled;
+  const interimTranslateTimeoutRef = useRef(null);
+  const interimSeqRef = useRef(0);
 
   const closeWs = useCallback(() => {
     if (wsRef.current) {
@@ -65,13 +76,93 @@ function SessionContent() {
     }
   }, []);
 
+  const stopTts = useCallback(() => {
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current.src = '';
+      } catch (_) {}
+      ttsAudioRef.current = null;
+    }
+  }, []);
+
+  const processTtsQueue = useCallback(() => {
+    if (ttsPlayingRef.current || ttsQueueRef.current.length === 0) return;
+    const item = ttsQueueRef.current.shift();
+    if (!item) {
+      processTtsQueue();
+      return;
+    }
+    ttsPlayingRef.current = true;
+    speakTranslation({ text: item.text, language: item.language })
+      .then((blob) => {
+        // #region agent log
+        try { fetch('http://127.0.0.1:7244/ingest/cfc990f1-eed1-486e-a93b-9964f3d2d406', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location: 'session/page.js:ttsBlob', message: 'TTS blob received', data: { blobSize: blob?.size ?? 0, blobType: blob?.type ?? '' }, timestamp: Date.now(), hypothesisId: 'H1' }) }).catch(() => {}); } catch (_) {}
+        // #endregion
+        if (!blob || blob.size === 0) {
+          ttsPlayingRef.current = false;
+          processTtsQueue();
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        ttsAudioRef.current = audio;
+        const cleanup = (source) => {
+          // #region agent log
+          try { fetch('http://127.0.0.1:7244/ingest/cfc990f1-eed1-486e-a93b-9964f3d2d406', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ location: 'session/page.js:ttsCleanup', message: 'TTS cleanup', data: { source }, timestamp: Date.now(), hypothesisId: 'H2_H4' }) }).catch(() => {}); } catch (_) {}
+          // #endregion
+          URL.revokeObjectURL(url);
+          ttsAudioRef.current = null;
+          ttsPlayingRef.current = false;
+          processTtsQueue();
+        };
+        audio.addEventListener('ended', () => cleanup('ended'));
+        audio.addEventListener('error', (e) => cleanup('error'));
+        audio.play().catch(() => cleanup('playRejected'));
+      })
+      .catch(() => {
+        ttsPlayingRef.current = false;
+        processTtsQueue();
+      });
+  }, []);
+
+  const handleSpeakTranslationToggle = useCallback((enabled) => {
+    setSpeakTranslationEnabled(enabled);
+    if (!enabled) stopTts();
+  }, [stopTts]);
+
   const handleStopSession = useCallback(() => {
+    stopTts();
     stopTimer();
     stopMic();
     closeWs();
     setSessionStartTime(null);
     router.push('/');
-  }, [router, stopTimer, stopMic, closeWs]);
+  }, [router, stopTimer, stopMic, closeWs, stopTts]);
+
+  const effectiveSource = speakingLang;
+  const effectiveTarget = speakingLang === from ? to : from;
+
+  const handleSwitchDirection = useCallback(() => {
+    setSourceText('');
+    setInterim('');
+    setTranslationText('');
+    setInterimTranslation('');
+    if (interimTranslateTimeoutRef.current) {
+      clearTimeout(interimTranslateTimeoutRef.current);
+      interimTranslateTimeoutRef.current = null;
+    }
+    setSpeakingLang((prev) => (prev === from ? to : from));
+    if (isRecording) {
+      stopTimer();
+      stopMic();
+      closeWs();
+      setSessionStartTime(null);
+      setIsRecording(false);
+    }
+  }, [from, to, isRecording, stopTimer, stopMic, closeWs]);
 
   const handleMicToggle = useCallback(async () => {
     if (isRecording) {
@@ -114,10 +205,11 @@ function SessionContent() {
       const scriptNode = ctx.createScriptProcessor(bufferSize, 1, 1);
       processorRef.current = scriptNode;
 
-      const wsUrl = getTranscriptWebSocketUrl(from);
+      const wsUrl = getTranscriptWebSocketUrl(effectiveSource);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
+      const INTERIM_DEBOUNCE_MS = 400;
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
@@ -127,15 +219,48 @@ function SessionContent() {
           }
           if (msg.text != null) {
             if (msg.isFinal) {
+              if (interimTranslateTimeoutRef.current) {
+                clearTimeout(interimTranslateTimeoutRef.current);
+                interimTranslateTimeoutRef.current = null;
+              }
+              setInterimTranslation('');
               setSourceText((prev) => (prev ? `${prev} ${msg.text}` : msg.text).trim());
               setInterim('');
-              translateApi({ text: msg.text, sourceLang: from, targetLang: to })
+              translateApi({ text: msg.text, sourceLang: effectiveSource, targetLang: effectiveTarget })
                 .then((translated) => {
                   setTranslationText((prev) => (prev ? `${prev} ${translated}` : translated).trim());
+                  const trimmed = (translated || '').trim();
+                  if (speakEnabledRef.current && trimmed) {
+                    ttsQueueRef.current.push({ text: trimmed, language: effectiveTarget });
+                    processTtsQueue();
+                  }
                 })
                 .catch((err) => setError(err.message));
             } else {
               setInterim(msg.text);
+              const interimText = (msg.text || '').trim();
+              if (!interimText) {
+                setInterimTranslation('');
+                if (interimTranslateTimeoutRef.current) {
+                  clearTimeout(interimTranslateTimeoutRef.current);
+                  interimTranslateTimeoutRef.current = null;
+                }
+                return;
+              }
+              if (interimTranslateTimeoutRef.current) {
+                clearTimeout(interimTranslateTimeoutRef.current);
+              }
+              const gen = ++interimSeqRef.current;
+              interimTranslateTimeoutRef.current = setTimeout(() => {
+                interimTranslateTimeoutRef.current = null;
+                translateApi({ text: interimText, sourceLang: effectiveSource, targetLang: effectiveTarget })
+                  .then((translated) => {
+                    if (gen === interimSeqRef.current) {
+                      setInterimTranslation((translated || '').trim());
+                    }
+                  })
+                  .catch(() => {});
+              }, INTERIM_DEBOUNCE_MS);
             }
           }
         } catch (_) {}
@@ -200,35 +325,50 @@ function SessionContent() {
       setMicRequesting(false);
       setError(err.message || 'Could not access microphone');
     }
-  }, [from, to, isRecording, stopMic, closeWs, stopTimer]);
+  }, [effectiveSource, effectiveTarget, isRecording, stopMic, closeWs, stopTimer, processTtsQueue]);
 
   useEffect(() => {
     return () => {
+      if (interimTranslateTimeoutRef.current) {
+        clearTimeout(interimTranslateTimeoutRef.current);
+        interimTranslateTimeoutRef.current = null;
+      }
+      stopTts();
       stopTimer();
       stopMic();
       closeWs();
     };
-  }, [stopTimer, stopMic, closeWs]);
+  }, [stopTimer, stopMic, closeWs, stopTts]);
 
   const displaySource = [sourceText, interim].filter(Boolean).join(' ');
+  const displayTranslation = translationText + (interimTranslation ? ' ' + interimTranslation : '');
 
   return (
-    <div className="flex h-screen flex-col bg-zinc-50 dark:bg-zinc-950">
+    <div className="flex h-screen flex-col bg-session-gradient">
       {micRequesting && (
-        <div className="bg-blue-50 px-4 py-2 text-sm text-blue-800 dark:bg-blue-900 dark:text-blue-200">
-          Requesting microphone access… If no prompt appears, click the lock or info icon in the address bar and set Microphone to Allow.
+        <div className="mx-4 mt-14 animate-fade-in rounded-2xl border border-indigo-200/60 bg-indigo-50/80 backdrop-blur-sm px-4 py-3 text-sm text-indigo-700 shadow-sm dark:border-indigo-800/40 dark:bg-indigo-900/20 dark:text-indigo-300">
+          <div className="flex items-center gap-2">
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
+            Requesting microphone access… If no prompt appears, click the lock icon in the address bar.
+          </div>
         </div>
       )}
       {error && (
-        <div className="bg-amber-100 px-4 py-2 text-sm text-amber-800 dark:bg-amber-900 dark:text-amber-200">
-          {error}
+        <div className="mx-4 mt-14 animate-fade-in rounded-2xl border border-amber-200/60 bg-amber-50/80 backdrop-blur-sm px-4 py-3 text-sm text-amber-700 shadow-sm dark:border-amber-800/40 dark:bg-amber-900/20 dark:text-amber-300">
+          <div className="flex items-center gap-2">
+            <svg className="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+            </svg>
+            {error}
+          </div>
         </div>
       )}
-      <div className="flex-1 overflow-hidden p-4">
+      <div className="flex-1 overflow-hidden p-4 pt-16">
         <DualPane
           sourceText={displaySource}
-          translationText={translationText}
+          translationText={displayTranslation}
           onCopySource={(text) => navigator.clipboard?.writeText(text)}
+          onCopyTranslation={(text) => navigator.clipboard?.writeText(text)}
         />
       </div>
       <SessionFooter
@@ -236,8 +376,13 @@ function SessionContent() {
         isRecording={isRecording}
         onMicToggle={handleMicToggle}
         onStopSession={handleStopSession}
-        sourceName={LANGUAGE_NAMES[from] || from}
-        targetName={LANGUAGE_NAMES[to] || to}
+        sourceName={LANGUAGE_NAMES[effectiveSource] || effectiveSource}
+        targetName={LANGUAGE_NAMES[effectiveTarget] || effectiveTarget}
+        speakTranslationEnabled={speakTranslationEnabled}
+        onSpeakTranslationToggle={handleSpeakTranslationToggle}
+        twoWay={twoWay}
+        onSwitchDirection={handleSwitchDirection}
+        otherLangName={twoWay ? (LANGUAGE_NAMES[effectiveTarget] || effectiveTarget) : undefined}
       />
     </div>
   );
@@ -245,7 +390,14 @@ function SessionContent() {
 
 export default function SessionPage() {
   return (
-    <Suspense fallback={<div className="flex h-screen items-center justify-center">Loading…</div>}>
+    <Suspense fallback={
+      <div className="flex h-screen items-center justify-center bg-session-gradient">
+        <div className="flex flex-col items-center gap-3 animate-fade-in">
+          <div className="h-10 w-10 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
+          <p className="text-sm font-medium text-slate-500 dark:text-slate-400">Loading session…</p>
+        </div>
+      </div>
+    }>
       <SessionContent />
     </Suspense>
   );
